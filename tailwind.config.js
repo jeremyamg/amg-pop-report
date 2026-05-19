@@ -1,17 +1,15 @@
 /** @type {import('tailwindcss').Config} */
-import defaultTheme from "tailwindcss/defaultTheme"
-
 module.exports = {
   content: ["./src/**/*.{ts,tsx}"],
   theme: {
     fontFamily: {
-      "theme-font-extra-bold": ["NeueHaasDisplayBlack", ...defaultTheme.fontFamily.sans],
-      "theme-font-bold": ["NeueHaasDisplayBold", ...defaultTheme.fontFamily.sans],
-      "theme-font-light": ["NeueHaasDisplayLight", ...defaultTheme.fontFamily.sans],
-      "theme-font-thin": ["NeueHaasDisplayThin", ...defaultTheme.fontFamily.sans],
-      "theme-font-medium": ["NeueHaasDisplayMediu", ...defaultTheme.fontFamily.sans],
-      "theme-font-roman": ["NeueHaasDisplayRoman", ...defaultTheme.fontFamily.sans],
-      "theme-font-light-italic": ["NeueHaasDisplayLightItalic", ...defaultTheme.fontFamily.sans],
+      "theme-font-extra-bold": ["Neue Haas Grotesk Display Pro", "sans-serif"],
+      "theme-font-bold": ["Neue Haas Grotesk Display Pro", "sans-serif"],
+      "theme-font-light": ["Neue Haas Grotesk Display Pro", "sans-serif"],
+      "theme-font-thin": ["Neue Haas Grotesk Display Pro", "sans-serif"],
+      "theme-font-medium": ["Neue Haas Grotesk Display Pro", "sans-serif"],
+      "theme-font-roman": ["Neue Haas Grotesk Display Pro", "sans-serif"],
+      "theme-font-light-italic": ["Neue Haas Grotesk Display Pro", "sans-serif"],
     },
     extend: {
       colors: {

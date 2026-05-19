@@ -64,7 +64,7 @@ export default function Header() {
           {/* Right nav */}
           <div className="flex flex-row gap-4 items-center">
             <a
-              href={`${BASE}/sign-in`}
+              href={`${BASE}/account/login`}
               className="text-sm font-theme-font-roman text-[#100F0F] border border-[#100F0F] rounded-full px-4 py-2 hover:opacity-70"
             >
               Log in
