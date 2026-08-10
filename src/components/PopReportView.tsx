@@ -1,8 +1,8 @@
 'use client';
 
 import Image from 'next/image';
-import { useState, useEffect } from 'react';
-import styles from './PopReport.module.css';
+import React, { useState, useEffect } from 'react';
+import styles from '@/app/PopReport.module.css';
 
 interface GradeDistribution {
   [key: string]: number;
@@ -39,7 +39,13 @@ interface SearchResponse {
   error?: string;
 }
 
-export default function PopReport() {
+/**
+ * The Population Report search UI.
+ *
+ * `embed` strips everything that only makes sense on the full page (hero, search
+ * box, info cards) so the results table can be dropped into an iframe on the blog.
+ */
+export default function PopReportView({ embed = false }: { embed?: boolean }) {
   const [searchTerm, setSearchTerm] = useState('');
   const [currentSearchTerm, setCurrentSearchTerm] = useState('');
   const [currentItemType, setCurrentItemType] = useState('Total');
@@ -53,7 +59,10 @@ export default function PopReport() {
   const [expandedAlbums, setExpandedAlbums] = useState<Set<number>>(new Set());
   const [expandedMedia, setExpandedMedia] = useState<Set<string>>(new Set());
 
+  // Autocomplete suggestions (the embed has no search box, so skip the fetch)
   useEffect(() => {
+    if (embed) return;
+
     const loadSuggestions = async () => {
       try {
         const [artistsRes, albumsRes] = await Promise.all([
@@ -74,7 +83,7 @@ export default function PopReport() {
     };
 
     loadSuggestions();
-  }, []);
+  }, [embed]);
 
   const getItemTypeCounts = async (term: string) => {
     try {
@@ -105,23 +114,35 @@ export default function PopReport() {
     }
   };
 
-  const performSearch = async (e?: React.FormEvent) => {
-    e?.preventDefault();
+  // Keep the URL in sync with the current search so results can be linked to or
+  // embedded. Pointless inside an iframe, where nobody sees the address bar.
+  const updateUrl = (term: string, itemType: string) => {
+    if (embed) return;
 
-    if (!searchTerm.trim()) {
-      alert('Please enter an artist or album name');
-      return;
-    }
+    const params = new URLSearchParams();
+    if (term) params.set('q', term);
+    if (itemType && itemType !== 'Total') params.set('type', itemType);
+    const query = params.toString();
+    window.history.replaceState(null, '', query ? `${window.location.pathname}?${query}` : window.location.pathname);
+  };
 
-    setCurrentSearchTerm(searchTerm);
-    setCurrentItemType('Total');
+  const runSearch = async (term: string, itemType: string = 'Total') => {
+    const trimmed = term.trim();
+    if (!trimmed) return;
+
+    setCurrentSearchTerm(trimmed);
+    setCurrentItemType(itemType);
     setShowResults(true);
     setLoading(true);
     setExpandedAlbums(new Set());
     setExpandedMedia(new Set());
 
     try {
-      const response = await fetch(`/api/search?q=${encodeURIComponent(searchTerm)}`);
+      const url = itemType === 'Total'
+        ? `/api/search?q=${encodeURIComponent(trimmed)}`
+        : `/api/search?q=${encodeURIComponent(trimmed)}&itemType=${encodeURIComponent(itemType)}`;
+
+      const response = await fetch(url);
       const result: SearchResponse = await response.json();
 
       if (!response.ok) {
@@ -132,7 +153,7 @@ export default function PopReport() {
         setResults(result.data);
         setResultCount(result.count);
         setAvailableItemTypes(result.availableItemTypes || []);
-        const counts = await getItemTypeCounts(searchTerm);
+        const counts = await getItemTypeCounts(trimmed);
         setItemTypeCounts(counts);
       } else {
         setResults([]);
@@ -147,10 +168,34 @@ export default function PopReport() {
     }
   };
 
+  // Run the search straight away when the page is opened with ?q= (deep links, blog embeds).
+  useEffect(() => {
+    const params = new URLSearchParams(window.location.search);
+    const q = params.get('q');
+    if (!q) return;
+
+    setSearchTerm(q);
+    runSearch(q, params.get('type') || 'Total');
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, []);
+
+  const performSearch = async (e?: React.FormEvent) => {
+    e?.preventDefault();
+
+    if (!searchTerm.trim()) {
+      alert('Please enter an artist or album name');
+      return;
+    }
+
+    updateUrl(searchTerm.trim(), 'Total');
+    await runSearch(searchTerm, 'Total');
+  };
+
   const filterByItemType = async (itemType: string) => {
     if (!currentSearchTerm) return;
 
     setCurrentItemType(itemType);
+    updateUrl(currentSearchTerm, itemType);
     setLoading(true);
 
     try {
@@ -201,52 +246,61 @@ export default function PopReport() {
     setResults([]);
     setExpandedAlbums(new Set());
     setExpandedMedia(new Set());
+    updateUrl('', 'Total');
   };
 
+  const fullReportUrl = currentSearchTerm
+    ? `/?q=${encodeURIComponent(currentSearchTerm)}${currentItemType !== 'Total' ? `&type=${encodeURIComponent(currentItemType)}` : ''}`
+    : '/';
+
   return (
-    <div className={styles.popReportPage}>
-      <section className={styles.heroSection}>
-        <h1 className={styles.heroTitle}>AMG Population Report</h1>
-        <p className={styles.heroDescription}>
-          Use AMG&apos;s Population Report search to determine the number of vinyl, cassettes, CDs and 8-tracks that AMG has graded for each artist and album in our database.
-        </p>
-      </section>
+    <div className={`${styles.popReportPage} ${embed ? styles.embedPage : ''}`}>
+      {!embed && (
+        <section className={styles.heroSection}>
+          <h1 className={styles.heroTitle}>AMG Population Report</h1>
+          <p className={styles.heroDescription}>
+            Use AMG&apos;s Population Report search to determine the number of vinyl, cassettes, CDs and 8-tracks that AMG has graded for each artist and album in our database.
+          </p>
+        </section>
+      )}
 
-      <div className={styles.searchContainer}>
-        <form onSubmit={performSearch} className={styles.searchBox}>
-          <input
-            type="text"
-            value={searchTerm}
-            onChange={(e) => setSearchTerm(e.target.value)}
-            className={styles.searchInput}
-            placeholder="Try: Taylor Swift, 1989, Beatles..."
-            list="searchSuggestions"
-          />
-          <datalist id="searchSuggestions">
-            {allSuggestions.map((suggestion, i) => (
-              <option key={i} value={suggestion} />
-            ))}
-          </datalist>
-          {searchTerm && (
-            <button
-              type="button"
-              onClick={clearSearch}
-              className={styles.clearBtn}
-              title="Clear search"
-            >
-              ✕
+      {!embed && (
+        <div className={styles.searchContainer}>
+          <form onSubmit={performSearch} className={styles.searchBox}>
+            <input
+              type="text"
+              value={searchTerm}
+              onChange={(e) => setSearchTerm(e.target.value)}
+              className={styles.searchInput}
+              placeholder="Try: Taylor Swift, 1989, Beatles..."
+              list="searchSuggestions"
+            />
+            <datalist id="searchSuggestions">
+              {allSuggestions.map((suggestion, i) => (
+                <option key={i} value={suggestion} />
+              ))}
+            </datalist>
+            {searchTerm && (
+              <button
+                type="button"
+                onClick={clearSearch}
+                className={styles.clearBtn}
+                title="Clear search"
+              >
+                ✕
+              </button>
+            )}
+            <button type="submit" className={styles.searchButton} disabled={loading}>
+              <svg width="24" height="24" viewBox="0 0 24 24" fill="none">
+                <path d="M11.5 21C16.7467 21 21 16.7467 21 11.5C21 6.25329 16.7467 2 11.5 2C6.25329 2 2 6.25329 2 11.5C2 16.7467 6.25329 21 11.5 21Z" stroke="white" strokeWidth="1.5" strokeLinecap="round" strokeLinejoin="round"/>
+                <path d="M22 22L20 20" stroke="white" strokeWidth="1.5" strokeLinecap="round" strokeLinejoin="round"/>
+              </svg>
             </button>
-          )}
-          <button type="submit" className={styles.searchButton} disabled={loading}>
-            <svg width="24" height="24" viewBox="0 0 24 24" fill="none">
-              <path d="M11.5 21C16.7467 21 21 16.7467 21 11.5C21 6.25329 16.7467 2 11.5 2C6.25329 2 2 6.25329 2 11.5C2 16.7467 6.25329 21 11.5 21Z" stroke="white" strokeWidth="1.5" strokeLinecap="round" strokeLinejoin="round"/>
-              <path d="M22 22L20 20" stroke="white" strokeWidth="1.5" strokeLinecap="round" strokeLinejoin="round"/>
-            </svg>
-          </button>
-        </form>
-      </div>
+          </form>
+        </div>
+      )}
 
-      {!showResults && (
+      {!embed && !showResults && (
         <section className={styles.infoSection}>
           <div className={styles.infoCard}>
             <Image src="/images/popreport/magnifying.png" alt="Search" className={styles.infoIcon} width={106} height={106} />
@@ -269,11 +323,23 @@ export default function PopReport() {
         </section>
       )}
 
+      {/* Embed loaded without a ?q= - nothing to show, so point at the real thing */}
+      {embed && !showResults && (
+        <div className={styles.embedEmpty}>
+          <p>
+            No search specified.{' '}
+            <a href="/" target="_blank" rel="noopener noreferrer">
+              Search the AMG Population Report →
+            </a>
+          </p>
+        </div>
+      )}
+
       {showResults && (
         <section className={styles.resultsSection}>
           <div className={styles.resultHeader}>
-            <h2 className={styles.resultTitle}>
-              Results for &quot;{currentSearchTerm}&quot;
+            <h2 className={embed ? styles.embedTitle : styles.resultTitle}>
+              {embed ? `AMG Population Report: ${currentSearchTerm}` : `Results for "${currentSearchTerm}"`}
               {currentItemType !== 'Total' && ` (${currentItemType})`}
             </h2>
             <p className={styles.resultCount}>
@@ -346,9 +412,8 @@ export default function PopReport() {
                     const isExpanded = expandedAlbums.has(index);
 
                     return (
-                      <>
+                      <React.Fragment key={index}>
                         <tr
-                          key={index}
                           className={`${styles.albumRow} ${isExpanded ? styles.expanded : ''}`}
                           onClick={() => toggleAlbum(index)}
                         >
@@ -374,9 +439,8 @@ export default function PopReport() {
                           const isMediaExpanded = expandedMedia.has(mediaKey);
 
                           return (
-                            <>
+                            <React.Fragment key={mediaKey}>
                               <tr
-                                key={mediaKey}
                                 className={`${styles.detailRow} ${styles.mediaRow} ${isMediaExpanded ? styles.expanded : ''}`}
                                 onClick={(e) => {
                                   e.stopPropagation();
@@ -429,15 +493,26 @@ export default function PopReport() {
                                   </tr>
                                 );
                               })}
-                            </>
+                            </React.Fragment>
                           );
                         })}
-                      </>
+                      </React.Fragment>
                     );
                   })}
                 </tbody>
               </table>
             </div>
+          )}
+
+          {/* Attribution / escape hatch out of the iframe */}
+          {embed && (
+            <p className={styles.embedFooter}>
+              Population data from{' '}
+              <a href={fullReportUrl} target="_blank" rel="noopener noreferrer">
+                Audio Media Grading
+              </a>
+              . Updated daily.
+            </p>
           )}
         </section>
       )}
