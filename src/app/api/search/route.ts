@@ -1,5 +1,6 @@
 import { NextRequest, NextResponse } from 'next/server';
 import clientPromise from '@/lib/mongodb';
+import { withCors, corsPreflight } from '@/lib/cors';
 
 export const dynamic = 'force-dynamic';
 
@@ -64,7 +65,7 @@ async function logSearch(db: any, searchTerm: string, resultCount: number, itemT
   }
 }
 
-export async function GET(request: NextRequest) {
+async function handleSearch(request: NextRequest) {
   try {
     const searchParams = request.nextUrl.searchParams;
     const q = searchParams.get('q');
@@ -390,4 +391,14 @@ export async function GET(request: NextRequest) {
       { status: 500 }
     );
   }
+}
+
+// Wrapped so every exit path above - success, validation error, 500 - carries
+// the CORS headers, rather than having to remember them at each return.
+export async function GET(request: NextRequest) {
+  return withCors(request, await handleSearch(request));
+}
+
+export async function OPTIONS(request: NextRequest) {
+  return corsPreflight(request);
 }
