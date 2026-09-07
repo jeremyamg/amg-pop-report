@@ -1,28 +1,40 @@
 'use client';
 import { useState } from 'react';
 
+type Status = { kind: 'ok' | 'error'; text: string };
+
 export default function SubscribeEmail() {
   const [inputText, setInputText] = useState('');
   const [loading, setLoading] = useState(false);
+  const [status, setStatus] = useState<Status | null>(null);
 
   const handleSubmit = async (e: React.FormEvent<HTMLFormElement>) => {
     e.preventDefault();
     setLoading(true);
+    setStatus(null);
+
     try {
       const response = await fetch('/api/subscribe', {
         method: 'POST',
         headers: { 'Content-Type': 'application/json' },
         body: JSON.stringify({ email: inputText }),
       });
-      if (response.status === 200) {
-        setInputText('Subscribed!');
+
+      if (response.ok) {
+        setInputText('');
+        setStatus({ kind: 'ok', text: 'Subscribed!' });
+      } else if (response.status >= 500) {
+        // A server or config problem on our side, not something the reader can fix.
+        setStatus({ kind: 'error', text: 'Something went wrong on our end. Please try again later.' });
       } else {
-        setInputText('Email already exists!');
+        const body = await response.json().catch(() => null);
+        setStatus({ kind: 'error', text: body?.error || 'Subscription failed. Please try again.' });
       }
     } catch {
-      // silent
+      setStatus({ kind: 'error', text: 'Could not reach the server. Please check your connection and try again.' });
+    } finally {
+      setLoading(false);
     }
-    setLoading(false);
   };
 
   return (
@@ -38,11 +50,21 @@ export default function SubscribeEmail() {
         />
         <button
           type="submit"
-          className="text-[14px] flex items-center justify-center w-[140px] border-l border-l-white px-2"
+          disabled={loading}
+          className="text-[14px] flex items-center justify-center w-[140px] border-l border-l-white px-2 disabled:opacity-60"
         >
           {loading ? '...' : 'Subscribe'}
         </button>
       </div>
+      {status && (
+        <p
+          role="status"
+          aria-live="polite"
+          className={`text-[14px] mt-2 ${status.kind === 'error' ? 'text-red-300' : 'text-white'}`}
+        >
+          {status.text}
+        </p>
+      )}
     </form>
   );
 }

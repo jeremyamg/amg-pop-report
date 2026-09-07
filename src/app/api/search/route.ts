@@ -1,5 +1,6 @@
 import { NextRequest, NextResponse } from 'next/server';
-import clientPromise from '@/lib/mongodb';
+import type { Db, Document } from 'mongodb';
+import clientPromise, { DB_NAME } from '@/lib/mongodb';
 import { withCors, corsPreflight } from '@/lib/cors';
 
 export const dynamic = 'force-dynamic';
@@ -38,31 +39,75 @@ function validateSearchTerm(term: any): { valid: boolean; error?: string; term?:
   return { valid: true, term: trimmed };
 }
 
-// Log search to MongoDB
-async function logSearch(db: any, searchTerm: string, resultCount: number, itemType: string) {
+// Log search to MongoDB. One row per term, item type, and 5-second window; the
+// unique `search_dedup` index (see lib/indexes.ts) is what makes that atomic -
+// a second concurrent insert for the same window fails with a duplicate-key
+// error instead of producing a second row.
+async function logSearch(db: Db, searchTerm: string, resultCount: number, itemType: string) {
   try {
-    // Check if we already logged this exact search in the last 5 seconds
-    const fiveSecondsAgo = new Date(Date.now() - 5000);
-    const recentLog = await db.collection('search_logs').findOne({
-      searchTerm: searchTerm.toLowerCase().trim(),
-      itemType,
-      timestamp: { $gte: fiveSecondsAgo }
-    });
-
-    if (recentLog) {
-      console.log('Duplicate search detected, skipping log');
-      return;
-    }
-
     await db.collection('search_logs').insertOne({
       searchTerm: searchTerm.toLowerCase().trim(),
       resultCount,
       itemType,
       timestamp: new Date(),
+      bucket: Math.floor(Date.now() / 5000),
     });
-  } catch (error) {
+  } catch (error: any) {
+    if (error?.code === 11000) return; // already logged within this window
     console.error('Logging error:', error);
   }
+}
+
+// The columns of the report. masterGrade is stored as an int 1-10 or the string
+// 'AUTHENTIC'; anything else counts toward totals but toward no column.
+const GRADE_KEYS = ['AUTHENTIC', '1', '2', '3', '4', '5', '6', '7', '8', '9', '10'];
+
+const gradeKey = {
+  $switch: {
+    branches: [
+      { case: { $eq: ['$masterGrade', 'AUTHENTIC'] }, then: 'AUTHENTIC' },
+      { case: { $in: ['$masterGrade', [1, 2, 3, 4, 5, 6, 7, 8, 9, 10]] }, then: { $toString: '$masterGrade' } },
+    ],
+    default: null,
+  },
+};
+
+// [[a, b], [c]] -> [a, b, c]
+function flatten(arrays: Document | string): Document {
+  return {
+    $reduce: {
+      input: arrays,
+      initialValue: [],
+      in: { $concatArrays: ['$$value', '$$this'] },
+    },
+  };
+}
+
+// Turn a list of { k: grade, v: count } tallies into the { AUTHENTIC: n, '1': n,
+// ... '10': n } object the UI renders, zero-filling columns with no items. The
+// tallies are already counted per grade, so this sums at most a few dozen
+// numbers rather than re-scanning every item's grade at each level.
+function gradeDistribution(tallies: Document | string): Document {
+  return {
+    $arrayToObject: {
+      $map: {
+        input: GRADE_KEYS,
+        as: 'key',
+        in: {
+          k: '$$key',
+          v: {
+            $sum: {
+              $map: {
+                input: { $filter: { input: tallies, as: 't', cond: { $eq: ['$$t.k', '$$key'] } } },
+                as: 't',
+                in: '$$t.v',
+              },
+            },
+          },
+        },
+      },
+    },
+  };
 }
 
 async function handleSearch(request: NextRequest) {
@@ -93,293 +138,156 @@ async function handleSearch(request: NextRequest) {
     }
 
     const client = await clientPromise();
-    const db = client.db('grading_db');
+    const db = client.db(DB_NAME);
     
+    // A case-insensitive "contains" on either name. Each clause of the $or can
+    // walk that field's index instead of the whole collection.
     const searchPatterns = {
       $or: [
-        { artistPopReport: new RegExp(`^${escapedTerm}$`, 'i') },
-        { artistPopReport: new RegExp(`^The ${escapedTerm}$`, 'i') },
-        { artistPopReport: new RegExp(`\\b${escapedTerm}\\b`, 'i') },
         { artistPopReport: { $regex: escapedTerm, $options: 'i' } },
-        { albumPopReport: new RegExp(`^${escapedTerm}$`, 'i') },
-        { albumPopReport: new RegExp(`\\b${escapedTerm}\\b`, 'i') },
-        { albumPopReport: { $regex: escapedTerm, $options: 'i' } }
+        { albumPopReport: { $regex: escapedTerm, $options: 'i' } },
       ]
     };
 
-    const availableItemTypes = await db.collection('items').distinct('itemType', searchPatterns);
-    const filteredItemTypes = availableItemTypes
-      .filter((t: any) => t && typeof t === 'string' && t.trim() !== '' && t !== 'Unknown')
-      .sort();
-    
     const matchQuery: any = { ...searchPatterns };
 
     if (itemType && itemType !== 'Total') {
       matchQuery.itemType = itemType;
     }
 
-    const results = await db.collection('items').aggregate([
-      {
-        $match: matchQuery
-      },
-      {
-        $group: {
-          _id: {
-            album: '$albumPopReport',
-            artist: '$artistPopReport',
-            series: '$series',
-            variation: '$variation'
-          },
-          grades: { $push: '$masterGrade' },
-          count: { $sum: 1 }
-        }
-      },
-      {
-        $group: {
-          _id: {
-            album: '$_id.album',
-            artist: '$_id.artist',
-            series: '$_id.series'
-          },
-          variations: {
-            $push: {
-              type: '$_id.variation',
-              grades: '$grades',
-              count: '$count'
-            }
-          },
-          seriesGrades: { $push: '$grades' }
-        }
-      },
-      {
-        $group: {
-          _id: {
-            album: '$_id.album',
-            artist: '$_id.artist'
-          },
-          mediaTypes: {
-            $push: {
-              type: '$_id.series',
-              variations: '$variations',
-              grades: '$seriesGrades'
-            }
-          },
-          allGrades: { $push: '$seriesGrades' }
-        }
-      },
-      {
-        $project: {
-          album: '$_id.album',
-          artist: '$_id.artist',
-          mediaTypes: {
-            $map: {
-              input: '$mediaTypes',
-              as: 'media',
-              in: {
-                type: '$$media.type',
-                variations: {
-                  $map: {
-                    input: '$$media.variations',
-                    as: 'variation',
-                    in: {
-                      type: '$$variation.type',
-                      total: '$$variation.count',
-                      gradeDistribution: {
-                        $mergeObjects: [
-                          {
-                            AUTHENTIC: {
-                              $size: {
-                                $filter: {
-                                  input: '$$variation.grades',
-                                  as: 'g',
-                                  cond: { $eq: ['$$g', 'AUTHENTIC'] }
-                                }
-                              }
-                            }
-                          },
-                          {
-                            $arrayToObject: {
-                              $map: {
-                                input: { $range: [1, 11] },
-                                as: 'grade',
-                                in: {
-                                  k: { $toString: '$$grade' },
-                                  v: {
-                                    $size: {
-                                      $filter: {
-                                        input: '$$variation.grades',
-                                        as: 'g',
-                                        cond: { $eq: ['$$g', '$$grade'] }
-                                      }
-                                    }
-                                  }
-                                }
-                              }
-                            }
-                          }
-                        ]
-                      }
-                    }
-                  }
-                },
-                total: { 
-                  $sum: {
-                    $map: {
-                      input: '$$media.variations',
-                      as: 'v',
-                      in: '$$v.count'
-                    }
-                  }
-                },
-                gradeDistribution: {
-                  $let: {
-                    vars: {
-                      flatGrades: {
-                        $reduce: {
-                          input: '$$media.grades',
-                          initialValue: [],
-                          in: { $concatArrays: ['$$value', '$$this'] }
-                        }
-                      }
-                    },
-                    in: {
-                      $mergeObjects: [
-                        {
-                          AUTHENTIC: {
-                            $size: {
-                              $filter: {
-                                input: '$$flatGrades',
-                                as: 'g',
-                                cond: { $eq: ['$$g', 'AUTHENTIC'] }
-                              }
-                            }
-                          }
-                        },
-                        {
-                          $arrayToObject: {
-                            $map: {
-                              input: { $range: [1, 11] },
-                              as: 'grade',
-                              in: {
-                                k: { $toString: '$$grade' },
-                                v: {
-                                  $size: {
-                                    $filter: {
-                                      input: '$$flatGrades',
-                                      as: 'g',
-                                      cond: { $eq: ['$$g', '$$grade'] }
-                                    }
-                                  }
-                                }
-                              }
-                            }
-                          }
-                        }
-                      ]
-                    }
-                  }
-                }
+    const items = db.collection('items');
+
+    // Two independent queries, run together: how many matching items there are
+    // of each type (for the filter buttons, regardless of the current filter),
+    // and the report itself.
+    const [typeCounts, results] = await Promise.all([
+      items.aggregate([
+        { $match: searchPatterns },
+        { $group: { _id: '$itemType', count: { $sum: 1 } } },
+      ]).toArray(),
+
+      items.aggregate([
+        {
+          $match: matchQuery
+        },
+        // Count items per artist/album/series/variation/grade. Everything after
+        // this stage works with these small tallies, not the items themselves.
+        {
+          $group: {
+            _id: {
+              album: '$albumPopReport',
+              artist: '$artistPopReport',
+              series: '$series',
+              variation: '$variation',
+              grade: gradeKey
+            },
+            count: { $sum: 1 }
+          }
+        },
+        {
+          $group: {
+            _id: {
+              album: '$_id.album',
+              artist: '$_id.artist',
+              series: '$_id.series',
+              variation: '$_id.variation'
+            },
+            total: { $sum: '$count' },
+            grades: { $push: { k: '$_id.grade', v: '$count' } }
+          }
+        },
+        {
+          $group: {
+            _id: {
+              album: '$_id.album',
+              artist: '$_id.artist',
+              series: '$_id.series'
+            },
+            total: { $sum: '$total' },
+            grades: { $push: '$grades' },
+            variations: {
+              $push: {
+                type: '$_id.variation',
+                total: '$total',
+                grades: '$grades'
               }
             }
-          },
-          totalItems: {
-            $sum: {
+          }
+        },
+        {
+          $group: {
+            _id: {
+              album: '$_id.album',
+              artist: '$_id.artist'
+            },
+            totalItems: { $sum: '$total' },
+            grades: { $push: '$grades' },
+            mediaTypes: {
+              $push: {
+                type: '$_id.series',
+                total: '$total',
+                grades: '$grades',
+                variations: '$variations'
+              }
+            }
+          }
+        },
+        {
+          $project: {
+            album: '$_id.album',
+            artist: '$_id.artist',
+            totalItems: 1,
+            gradeDistribution: gradeDistribution(flatten(flatten('$grades'))),
+            mediaTypes: {
               $map: {
                 input: '$mediaTypes',
                 as: 'media',
                 in: {
-                  $sum: {
+                  type: '$$media.type',
+                  total: '$$media.total',
+                  gradeDistribution: gradeDistribution(flatten('$$media.grades')),
+                  variations: {
                     $map: {
                       input: '$$media.variations',
-                      as: 'v',
-                      in: '$$v.count'
+                      as: 'variation',
+                      in: {
+                        type: '$$variation.type',
+                        total: '$$variation.total',
+                        gradeDistribution: gradeDistribution('$$variation.grades')
+                      }
                     }
                   }
                 }
-              }
-            }
-          },
-          gradeDistribution: {
-            $let: {
-              vars: {
-                flatGrades: {
-                  $reduce: {
-                    input: {
-                      $reduce: {
-                        input: '$allGrades',
-                        initialValue: [],
-                        in: { $concatArrays: ['$$value', '$$this'] }
-                      }
-                    },
-                    initialValue: [],
-                    in: { $concatArrays: ['$$value', '$$this'] }
-                  }
-                }
-              },
-              in: {
-                $mergeObjects: [
-                  {
-                    AUTHENTIC: {
-                      $size: {
-                        $filter: {
-                          input: '$$flatGrades',
-                          as: 'g',
-                          cond: { $eq: ['$$g', 'AUTHENTIC'] }
-                        }
-                      }
-                    }
-                  },
-                  {
-                    $arrayToObject: {
-                      $map: {
-                        input: { $range: [1, 11] },
-                        as: 'grade',
-                        in: {
-                          k: { $toString: '$$grade' },
-                          v: {
-                            $size: {
-                              $filter: {
-                                input: '$$flatGrades',
-                                as: 'g',
-                                cond: { $eq: ['$$g', '$$grade'] }
-                              }
-                            }
-                          }
-                        }
-                      }
-                    }
-                  }
-                ]
               }
             }
           }
-        }
-      },
-      {
-        $sort: { artist: 1, album: 1 }
-      },
-      { $limit: 10000 }
-    ]).toArray();
+        },
+        {
+          $sort: { artist: 1, album: 1 }
+        },
+        { $limit: 10000 }
+      ]).toArray(),
+    ]);
 
-    // ✅ LOG THE SEARCH
-    await logSearch(db, searchTerm, results.length, itemType || 'Total');
-
-    if (results.length === 0) {
-      return NextResponse.json({
-        success: true,
-        searchTerm: searchTerm,
-        itemType: itemType || 'Total',
-        availableItemTypes: filteredItemTypes,
-        count: 0,
-        data: []
-      });
+    const itemTypeCounts: Record<string, number> = {};
+    let totalItems = 0;
+    for (const { _id: type, count } of typeCounts) {
+      totalItems += count;
+      if (typeof type === 'string' && type.trim() !== '' && type !== 'Unknown') {
+        itemTypeCounts[type] = count;
+      }
     }
+    const availableItemTypes = Object.keys(itemTypeCounts).sort();
+
+    await logSearch(db, searchTerm, results.length, itemType || 'Total');
 
     return NextResponse.json({
       success: true,
       searchTerm: searchTerm,
       itemType: itemType || 'Total',
-      availableItemTypes: filteredItemTypes,
+      availableItemTypes,
+      itemTypeCounts,
+      totalItems,
       count: results.length,
       data: results
     });
