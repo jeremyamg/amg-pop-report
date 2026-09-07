@@ -33,18 +33,25 @@ interface Analytics {
 export default function AnalyticsPage() {
   const [data, setData] = useState<Analytics | null>(null);
   const [loading, setLoading] = useState(true);
+  const [error, setError] = useState<string | null>(null);
 
   useEffect(() => {
     fetch('/api/analytics')
-      .then(res => res.json())
-      .then(data => {
-        setData(data);
-        setLoading(false);
-      });
+      .then(async res => {
+        if (!res.ok) throw new Error(`Analytics request failed (${res.status})`);
+        return res.json();
+      })
+      .then(setData)
+      .catch((err: Error) => setError(err.message))
+      .finally(() => setLoading(false));
   }, []);
 
   if (loading) return (
     <div style={{ padding: '40px', textAlign: 'center' }}>Loading analytics...</div>
+  );
+
+  if (error) return (
+    <div style={{ padding: '40px', textAlign: 'center', color: '#b32d24' }}>{error}</div>
   );
 
   if (!data) return (

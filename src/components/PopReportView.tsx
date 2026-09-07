@@ -1,7 +1,7 @@
 'use client';
 
 import Image from 'next/image';
-import React, { useState, useEffect } from 'react';
+import React, { useState, useEffect, useRef } from 'react';
 import styles from '@/app/PopReport.module.css';
 
 interface GradeDistribution {
@@ -34,9 +34,15 @@ interface SearchResponse {
   searchTerm: string;
   itemType: string;
   availableItemTypes: string[];
+  itemTypeCounts: { [key: string]: number };
+  totalItems: number;
   count: number;
   data: SearchResult[];
   error?: string;
+}
+
+function isAbortError(error: unknown): boolean {
+  return error instanceof Error && error.name === 'AbortError';
 }
 
 /**
@@ -52,6 +58,7 @@ export default function PopReportView({ embed = false }: { embed?: boolean }) {
   const [results, setResults] = useState<SearchResult[]>([]);
   const [availableItemTypes, setAvailableItemTypes] = useState<string[]>([]);
   const [itemTypeCounts, setItemTypeCounts] = useState<{ [key: string]: number }>({});
+  const [totalItems, setTotalItems] = useState(0);
   const [loading, setLoading] = useState(false);
   const [showResults, setShowResults] = useState(false);
   const [resultCount, setResultCount] = useState(0);
@@ -85,33 +92,29 @@ export default function PopReportView({ embed = false }: { embed?: boolean }) {
     loadSuggestions();
   }, [embed]);
 
-  const getItemTypeCounts = async (term: string) => {
-    try {
-      const response = await fetch(`/api/search?q=${encodeURIComponent(term)}`);
-      const result = await response.json();
+  // The search or filter request currently in flight. Starting a new one aborts
+  // it, so a slow older response can never arrive after a newer one and put
+  // stale results in the table.
+  const inFlight = useRef<AbortController | null>(null);
+  useEffect(() => () => inFlight.current?.abort(), []);
 
-      if (!result.success || result.data.length === 0) {
-        return {};
-      }
+  const fetchSearch = async (term: string, itemType: string): Promise<SearchResponse> => {
+    inFlight.current?.abort();
+    const controller = new AbortController();
+    inFlight.current = controller;
 
-      const totalItems = result.data.reduce((sum: number, item: SearchResult) => sum + (item.totalItems || 0), 0);
-      const counts: { [key: string]: number } = { '_total': totalItems };
+    const url = itemType === 'Total'
+      ? `/api/search?q=${encodeURIComponent(term)}`
+      : `/api/search?q=${encodeURIComponent(term)}&itemType=${encodeURIComponent(itemType)}`;
 
-      for (const type of result.availableItemTypes) {
-        const typeResponse = await fetch(`/api/search?q=${encodeURIComponent(term)}&itemType=${encodeURIComponent(type)}`);
-        const typeResult = await typeResponse.json();
+    const response = await fetch(url, { signal: controller.signal });
+    const result: SearchResponse = await response.json();
 
-        if (typeResult.success) {
-          const typeTotal = typeResult.data.reduce((sum: number, item: SearchResult) => sum + (item.totalItems || 0), 0);
-          counts[type] = typeTotal;
-        }
-      }
-
-      return counts;
-    } catch (error) {
-      console.error('Error getting counts:', error);
-      return {};
+    if (!response.ok) {
+      throw new Error(result.error || 'Search failed');
     }
+
+    return result;
   };
 
   // Keep the URL in sync with the current search so results can be linked to or
@@ -138,34 +141,20 @@ export default function PopReportView({ embed = false }: { embed?: boolean }) {
     setExpandedMedia(new Set());
 
     try {
-      const url = itemType === 'Total'
-        ? `/api/search?q=${encodeURIComponent(trimmed)}`
-        : `/api/search?q=${encodeURIComponent(trimmed)}&itemType=${encodeURIComponent(itemType)}`;
-
-      const response = await fetch(url);
-      const result: SearchResponse = await response.json();
-
-      if (!response.ok) {
-        throw new Error(result.error || 'Search failed');
-      }
-
-      if (result.success) {
-        setResults(result.data);
-        setResultCount(result.count);
-        setAvailableItemTypes(result.availableItemTypes || []);
-        const counts = await getItemTypeCounts(trimmed);
-        setItemTypeCounts(counts);
-      } else {
-        setResults([]);
-        setResultCount(0);
-      }
+      const result = await fetchSearch(trimmed, itemType);
+      setResults(result.data);
+      setResultCount(result.count);
+      setAvailableItemTypes(result.availableItemTypes || []);
+      setItemTypeCounts(result.itemTypeCounts || {});
+      setTotalItems(result.totalItems || 0);
     } catch (error) {
+      // Superseded by a newer request, which now owns the loading state.
+      if (isAbortError(error)) return;
       console.error('Search error:', error);
       setResults([]);
       setResultCount(0);
-    } finally {
-      setLoading(false);
     }
+    setLoading(false);
   };
 
   // Run the search straight away when the page is opened with ?q= (deep links, blog embeds).
@@ -199,22 +188,14 @@ export default function PopReportView({ embed = false }: { embed?: boolean }) {
     setLoading(true);
 
     try {
-      const url = itemType === 'Total'
-        ? `/api/search?q=${encodeURIComponent(currentSearchTerm)}`
-        : `/api/search?q=${encodeURIComponent(currentSearchTerm)}&itemType=${encodeURIComponent(itemType)}`;
-
-      const response = await fetch(url);
-      const result: SearchResponse = await response.json();
-
-      if (result.success) {
-        setResults(result.data);
-        setResultCount(result.count);
-      }
+      const result = await fetchSearch(currentSearchTerm, itemType);
+      setResults(result.data);
+      setResultCount(result.count);
     } catch (error) {
+      if (isAbortError(error)) return;
       console.error('Filter error:', error);
-    } finally {
-      setLoading(false);
     }
+    setLoading(false);
   };
 
   const toggleAlbum = (index: number) => {
@@ -353,7 +334,7 @@ export default function PopReportView({ embed = false }: { embed?: boolean }) {
                 className={`${styles.filterBtn} ${styles.total} ${currentItemType === 'Total' ? styles.active : ''}`}
                 onClick={() => filterByItemType('Total')}
               >
-                Total {itemTypeCounts['_total'] > 0 && <span className={styles.count}>({itemTypeCounts['_total']})</span>}
+                Total {totalItems > 0 && <span className={styles.count}>({totalItems})</span>}
               </button>
               {availableItemTypes.map((type) => {
                 if (!type || type === 'Unknown') return null;
